@@ -43,8 +43,6 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       return NextResponse.json({ error: "No segments to process." }, { status: 400 });
     }
 
-    const totalClips = omniSegments.length;
-
     const preparedSegments = segments.map((segment) => ({
       chunk_number: segment.chunk_number,
       storage_path: segment.storage_path,
@@ -58,8 +56,6 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         ? buildEditVideoPrompt({
             aspectRatio: project.aspect_ratio,
             resolution: project.resolution || "720p",
-            clipNumber: segment.chunk_number,
-            totalClips,
             durationSeconds: segment.omni_duration,
           })
         : "Raw footage — no Omni processing needed",
