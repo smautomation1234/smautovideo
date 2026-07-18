@@ -4,6 +4,7 @@ import type {
   StudioPayload,
   TimelineItem,
 } from "@/lib/types";
+import { TIMELINE_FPS } from "@/features/timeline/constants";
 
 export type StudioClip = Clip & { takes: ClipTake[] };
 
@@ -22,7 +23,7 @@ export interface TimelineSegment {
 
 export function createInitialTimelineItems(
   studio: StudioPayload,
-  fallbackFps = 25
+  fallbackFps = TIMELINE_FPS
 ): TimelineItem[] {
   const fps = studio.timeline?.fps || fallbackFps;
   const timelineId = studio.timeline?.id || crypto.randomUUID();
@@ -52,6 +53,33 @@ export function createInitialTimelineItems(
       muted: false,
       created_at: now,
       updated_at: now,
+    };
+  });
+}
+
+export function rescaleTimelineItemsFps(
+  items: TimelineItem[],
+  sourceFps: number,
+  targetFps = TIMELINE_FPS
+) {
+  const safeSourceFps = Math.max(1, sourceFps);
+  const safeTargetFps = Math.max(1, targetFps);
+  if (safeSourceFps === safeTargetFps) {
+    return items.map((item) => ({ ...item }));
+  }
+  const ratio = safeTargetFps / safeSourceFps;
+  return items.map((item) => {
+    const sourceInFrame = Math.max(
+      0,
+      Math.round(item.source_in_frame * ratio)
+    );
+    return {
+      ...item,
+      source_in_frame: sourceInFrame,
+      source_out_frame: Math.max(
+        sourceInFrame + 1,
+        Math.round(item.source_out_frame * ratio)
+      ),
     };
   });
 }

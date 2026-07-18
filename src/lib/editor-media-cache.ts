@@ -43,7 +43,7 @@ async function existingFile(key: string): Promise<File | null> {
 
 async function downloadToCache(
   key: string,
-  url: string,
+  url?: string,
   onProgress?: (progress: CacheProgress) => void
 ): Promise<File | Blob> {
   const local = await existingFile(key);
@@ -54,6 +54,10 @@ async function downloadToCache(
 
   const memory = memoryFallback.get(key);
   if (memory) return memory;
+
+  if (!url) {
+    throw new Error("Media is not cached and no download URL is available.");
+  }
 
   const response = await fetch(url, { cache: "force-cache" });
   if (!response.ok) throw new Error(`Media download failed (${response.status}).`);
@@ -99,7 +103,7 @@ async function downloadToCache(
 
 export function getCachedMedia(
   key: string,
-  url: string,
+  url?: string,
   onProgress?: (progress: CacheProgress) => void
 ) {
   const current = pending.get(key);

@@ -16,6 +16,7 @@ import {
 import {
   createInitialTimelineItems,
   duplicateTimelineItemAfter,
+  rescaleTimelineItemsFps,
   resolveTimelineSegments,
   splitTimelineItemAtFrame,
   type TimelineSegment,
@@ -50,21 +51,34 @@ interface ActiveTrimPreview {
 }
 
 export function StudioClient({ initial }: { initial: StudioPayload }) {
+  const sourceTimelineFps = initial.timeline?.fps || TIMELINE_FPS;
   const [data, setData] = useState(initial);
   const [busy, setBusy] = useState<string | null>(null);
   const [exportProgress, setExportProgress] = useState<string | null>(null);
 
   // Editor states
-  const [timelineFps] = useState(initial.timeline?.fps || TIMELINE_FPS);
+  const [timelineFps] = useState(TIMELINE_FPS);
   const [timelineItems, setTimelineItems] = useState<TimelineItem[]>(
-    initial.timeline?.items?.length
-      ? initial.timeline.items
-      : createInitialTimelineItems(initial, TIMELINE_FPS)
+    () => {
+      const sourceTimelineItems = initial.timeline?.items?.length
+        ? initial.timeline.items
+        : createInitialTimelineItems(initial, sourceTimelineFps);
+      return (
+      rescaleTimelineItemsFps(
+        sourceTimelineItems,
+        sourceTimelineFps,
+        TIMELINE_FPS
+      )
+      );
+    }
   );
   const timelineItemsRef = useRef<TimelineItem[]>(timelineItems);
   const timelineVersionRef = useRef(initial.timeline?.version || 1);
   const timelineAvailableRef = useRef(Boolean(initial.timeline));
   const timelineSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const legacyTimelineNeedsSaveRef = useRef(
+    Boolean(initial.timeline && sourceTimelineFps !== TIMELINE_FPS)
+  );
   const undoStackRef = useRef<TimelineItem[][]>([]);
   const redoStackRef = useRef<TimelineItem[][]>([]);
   const [activeClipId, setActiveClipId] = useState<string | null>(
@@ -87,8 +101,21 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
   const objectUrlsRef = useRef<Map<string, string>>(new Map());
   const thumbnailObjectUrlsRef = useRef<Set<string>>(new Set());
   const mediaFrameLimitsRef = useRef<Map<string, number>>(new Map());
+  const [mediaFrameCounts, setMediaFrameCounts] = useState<
+    Record<string, number>
+  >({});
   const [cacheStatus, setCacheStatus] = useState("Preparing local media…");
   const [cacheBytes, setCacheBytes] = useState({ usage: 0, quota: 0 });
+  const [cacheProgress, setCacheProgress] = useState({
+    ready: 0,
+    total: 0,
+    loadedBytes: 0,
+    totalBytes: 0,
+    failed: 0,
+  });
+  const [mediaCacheErrors, setMediaCacheErrors] = useState<
+    Record<string, string>
+  >({});
   const [cacheEpoch, setCacheEpoch] = useState(0);
 
   // Background Audio Integration
@@ -173,9 +200,19 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     timelineAvailableRef.current = true;
     if (timelineItemsRef.current.length || !data.timeline.items.length) return;
     timelineVersionRef.current = data.timeline.version;
-    timelineItemsRef.current = data.timeline.items;
-    setTimelineItems(data.timeline.items);
-    setActiveClipId(data.timeline.items[0]?.id || null);
+    const canonicalItems = rescaleTimelineItemsFps(
+      data.timeline.items,
+      data.timeline.fps || TIMELINE_FPS,
+      TIMELINE_FPS
+    );
+    timelineItemsRef.current = canonicalItems;
+    setTimelineItems(canonicalItems);
+    setActiveClipId(canonicalItems[0]?.id || null);
+    playbackItemIdRef.current = canonicalItems[0]?.id || null;
+    setPlaybackItemId(canonicalItems[0]?.id || null);
+    if (data.timeline.fps !== TIMELINE_FPS) {
+      legacyTimelineNeedsSaveRef.current = true;
+    }
   }, [data.timeline]);
 
   const [editedPrompts, setEditedPrompts] = useState<Record<string, string>>({});
@@ -214,6 +251,25 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     timelineSaveQueueRef.current = save.catch(() => undefined);
     return save;
   }, [initial.project.id, timelineFps]);
+
+  useEffect(() => {
+    if (!legacyTimelineNeedsSaveRef.current || !timelineAvailableRef.current) {
+      return;
+    }
+    legacyTimelineNeedsSaveRef.current = false;
+    void persistTimeline(timelineItemsRef.current)
+      .then(() => {
+        setCacheStatus("Legacy timeline upgraded to native 24 FPS.");
+      })
+      .catch((error) => {
+        legacyTimelineNeedsSaveRef.current = true;
+        setCacheStatus(
+          error instanceof Error
+            ? error.message
+            : "Could not upgrade the timeline to 24 FPS."
+        );
+      });
+  }, [persistTimeline]);
 
   const applyTimeline = useCallback((
     nextItems: TimelineItem[],
@@ -331,10 +387,11 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
   }, [playbackItemId, segments]);
 
   const activeSourceFrameCount = activeSegment
-    ? mediaFrameLimitsRef.current.get(activeSegment.assetKey) ||
+    ? mediaFrameCounts[activeSegment.assetKey] ||
+      mediaFrameLimitsRef.current.get(activeSegment.assetKey) ||
       Math.max(
         1,
-        Math.round(activeSegment.clip.duration_seconds * timelineFps)
+        Math.round(activeSegment.clip.duration_seconds * TIMELINE_FPS)
       )
     : 1;
 
@@ -391,15 +448,29 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
 
     const token = slotLoadTokensRef.current[slot] + 1;
     slotLoadTokensRef.current[slot] = token;
-    const alreadyAssigned = video.dataset.assetKey === segment.assetKey;
+    const alreadyAssigned =
+      video.dataset.assetKey === segment.assetKey &&
+      video.dataset.sourceUrl === url &&
+      video.readyState >= HTMLMediaElement.HAVE_METADATA;
     if (!alreadyAssigned) {
       video.pause();
       video.muted = true;
+      delete video.dataset.assetKey;
+      delete video.dataset.itemId;
       video.src = url;
-      video.dataset.assetKey = segment.assetKey;
-      video.dataset.itemId = segment.itemId;
+      video.dataset.sourceUrl = url;
       video.load();
-      await waitForMediaEvent(video, "loadedmetadata");
+      try {
+        await waitForMediaEvent(video, "loadedmetadata");
+      } catch (error) {
+        if (slotLoadTokensRef.current[slot] === token) {
+          delete video.dataset.assetKey;
+          delete video.dataset.itemId;
+          delete video.dataset.sourceUrl;
+        }
+        throw error;
+      }
+      video.dataset.assetKey = segment.assetKey;
     }
     if (slotLoadTokensRef.current[slot] !== token) {
       throw new Error("Preview request was replaced by a newer request.");
@@ -433,7 +504,11 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     playerRequestRef.current = request;
     const currentSlot = visibleVideoSlotRef.current;
     const currentVideo = videoForSlot(currentSlot);
-    const currentMatches = currentVideo?.dataset.assetKey === segment.assetKey;
+    const desiredUrl = playableUrl(segment);
+    const currentMatches =
+      currentVideo?.dataset.assetKey === segment.assetKey &&
+      currentVideo.dataset.sourceUrl === desiredUrl &&
+      currentVideo.readyState >= HTMLMediaElement.HAVE_METADATA;
     const targetSlot: 0 | 1 = currentMatches
       ? currentSlot
       : currentSlot === 0
@@ -453,13 +528,14 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     } else {
       targetVideo.pause();
     }
-  }, [activateVideoSlot, prepareVideoSlot, videoForSlot]);
+  }, [activateVideoSlot, playableUrl, prepareVideoSlot, videoForSlot]);
 
   // Download each unique immutable media file once. OPFS is used when available;
   // a memory Blob is the compatibility fallback.
   useEffect(() => {
     let cancelled = false;
-    const assets = Array.from(
+    void navigator.storage?.persist?.().catch(() => false);
+    const allAssets = Array.from(
       new Map(
         segments
           .map((segment) => [
@@ -469,56 +545,103 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
               url: segment.take?.signed_url || segment.clip.signed_source_url || "",
             },
           ] as const)
-          .filter((entry) => Boolean(entry[1].url))
       ).values()
-    ).filter((asset) => !localMediaFilesRef.current.has(asset.key));
+    );
+    const assets = allAssets.filter(
+      (asset) => !localMediaFilesRef.current.has(asset.key)
+    );
+    const initiallyReady = allAssets.length - assets.length;
+    setCacheProgress({
+      ready: initiallyReady,
+      total: allAssets.length,
+      loadedBytes: 0,
+      totalBytes: 0,
+      failed: 0,
+    });
     if (!assets.length) {
       if (segments.length) {
-        const waitingForMedia = segments.some(
-          (segment) =>
-            !localMediaFilesRef.current.has(segment.assetKey) &&
-            !segment.take?.signed_url &&
-            !segment.clip.signed_source_url
-        );
-        setCacheStatus(
-          waitingForMedia
-            ? "Waiting for generated clips…"
-            : "All clips ready locally."
-        );
+        setCacheStatus("All clips ready locally.");
       }
       return;
     }
 
     let completed = 0;
+    let ready = initiallyReady;
+    let failed = 0;
     let cursor = 0;
+    const byteProgress = new Map<
+      string,
+      { loaded: number; total: number | null }
+    >();
+    const publishProgress = () => {
+      let loadedBytes = 0;
+      let totalBytes = 0;
+      let hasUnknownTotal = false;
+      for (const progress of byteProgress.values()) {
+        loadedBytes += progress.loaded;
+        if (progress.total === null) {
+          hasUnknownTotal = true;
+        } else {
+          totalBytes += progress.total;
+        }
+      }
+      setCacheProgress({
+        ready,
+        total: allAssets.length,
+        loadedBytes,
+        totalBytes: hasUnknownTotal ? 0 : totalBytes,
+        failed,
+      });
+    };
     const worker = async () => {
       while (!cancelled) {
         const asset = assets[cursor];
         cursor += 1;
         if (!asset) return;
         try {
-          const file = await getCachedMedia(asset.key, asset.url).catch(() =>
-            getCachedMedia(
+          const onProgress = (progress: {
+            loaded: number;
+            total: number | null;
+          }) => {
+            byteProgress.set(asset.key, progress);
+            if (!cancelled) publishProgress();
+          };
+          let file: File | Blob;
+          try {
+            file = await getCachedMedia(asset.key, asset.url, onProgress);
+          } catch (directError) {
+            if (!asset.url) throw directError;
+            file = await getCachedMedia(
               asset.key,
-              `/api/proxy-video?url=${encodeURIComponent(asset.url)}`
-            )
-          );
+              `/api/proxy-video?url=${encodeURIComponent(asset.url)}`,
+              onProgress
+            );
+          }
           if (cancelled) return;
           localMediaFilesRef.current.set(asset.key, file);
           const metadataInput = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
           try {
             const track = await metadataInput.getPrimaryVideoTrack();
             const stats = track ? await track.computePacketStats() : null;
+            let frameCount = 0;
             if (stats?.packetCount) {
-              mediaFrameLimitsRef.current.set(asset.key, stats.packetCount);
+              frameCount = stats.packetCount;
             } else {
               const duration = await metadataInput.computeDuration();
               if (Number.isFinite(duration) && duration > 0) {
-                mediaFrameLimitsRef.current.set(
-                  asset.key,
-                  Math.max(1, Math.round(duration * timelineFps))
+                frameCount = Math.max(
+                  1,
+                  Math.round(duration * TIMELINE_FPS)
                 );
               }
+            }
+            if (frameCount > 0) {
+              mediaFrameLimitsRef.current.set(asset.key, frameCount);
+              setMediaFrameCounts((current) =>
+                current[asset.key] === frameCount
+                  ? current
+                  : { ...current, [asset.key]: frameCount }
+              );
             }
           } catch {
             mediaFrameLimitsRef.current.delete(asset.key);
@@ -531,14 +654,32 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
             objectUrlsRef.current.set(asset.key, objectUrl);
           }
           setLocalMediaUrls((current) => ({ ...current, [asset.key]: objectUrl! }));
+          setMediaCacheErrors((current) => {
+            if (!current[asset.key]) return current;
+            const next = { ...current };
+            delete next[asset.key];
+            return next;
+          });
+          ready += 1;
         } catch (error) {
           console.warn("Local media cache failed:", asset.key, error);
+          setMediaCacheErrors((current) => ({
+            ...current,
+            [asset.key]:
+              error instanceof Error
+                ? error.message
+                : "This clip could not be prepared.",
+          }));
+          failed += 1;
         } finally {
           completed += 1;
           if (!cancelled) {
+            publishProgress();
             setCacheStatus(
               completed === assets.length
-                ? "All clips ready locally."
+                ? failed
+                  ? `${ready}/${allAssets.length} clips ready locally · ${failed} unavailable.`
+                  : "All clips ready locally."
                 : `Preparing clips locally · ${completed}/${assets.length}`
             );
           }
@@ -552,7 +693,7 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     return () => {
       cancelled = true;
     };
-  }, [segments, timelineFps, cacheEpoch]);
+  }, [segments, cacheEpoch]);
 
   useEffect(() => {
     const objectUrls = objectUrlsRef.current;
@@ -570,6 +711,59 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
       thumbnailUrls.clear();
     };
   }, []);
+
+  // Reconcile saved ranges with the media itself. Packet count is authoritative;
+  // duration × 24 is used only until the file has been inspected.
+  useEffect(() => {
+    if (!Object.keys(mediaFrameCounts).length) return;
+    const current = timelineItemsRef.current;
+    const resolved = resolveTimelineSegments(current, data.clips, timelineFps);
+    const segmentByItem = new Map(
+      resolved.map((segment) => [segment.itemId, segment] as const)
+    );
+    let changed = false;
+    const next = current.map((item) => {
+      const segment = segmentByItem.get(item.id);
+      const actualFrameCount = segment
+        ? mediaFrameCounts[segment.assetKey]
+        : undefined;
+      if (!segment || !actualFrameCount) return item;
+
+      const nominalFrameCount = Math.max(
+        1,
+        Math.round(segment.clip.duration_seconds * TIMELINE_FPS)
+      );
+      const sourceInFrame = Math.min(
+        Math.max(0, item.source_in_frame),
+        actualFrameCount - 1
+      );
+      const representedTheFullSource =
+        item.source_in_frame === 0 &&
+        item.source_out_frame === nominalFrameCount;
+      const sourceOutFrame = Math.max(
+        sourceInFrame + 1,
+        representedTheFullSource
+          ? actualFrameCount
+          : Math.min(item.source_out_frame, actualFrameCount)
+      );
+      if (
+        sourceInFrame === item.source_in_frame &&
+        sourceOutFrame === item.source_out_frame
+      ) {
+        return item;
+      }
+      changed = true;
+      return {
+        ...item,
+        source_in_frame: sourceInFrame,
+        source_out_frame: sourceOutFrame,
+      };
+    });
+    if (changed) {
+      applyTimeline(next);
+      setCacheStatus("Timeline ranges matched to decoded video frames.");
+    }
+  }, [applyTimeline, data.clips, mediaFrameCounts, timelineFps]);
 
   useEffect(() => {
     const updateProgress = () => {
@@ -615,13 +809,18 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
       activeSegment.item.source_in_frame,
       activeSegment.item.source_out_frame
     );
+    const start = Math.min(visible.start, activeSourceFrameCount);
+    const end = Math.min(
+      activeSourceFrameCount,
+      Math.max(start, visible.end)
+    );
     setFrameDraft({
       itemId: activeSegment.itemId,
-      start: String(visible.start),
-      end: String(visible.end),
+      start: String(start),
+      end: String(end),
     });
     setFrameRangeError(null);
-  }, [activeSegment]);
+  }, [activeSegment, activeSourceFrameCount]);
 
   // Keep the current frame painted until the next video has decoded and
   // presented its first frame. The two players then exchange roles.
@@ -731,14 +930,28 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
   useEffect(() => {
     const segment = playbackSegment || segments[0];
     const video = visibleVideo();
-    if (!segment || !playableUrl(segment)) return;
-    if (video?.dataset.assetKey === segment.assetKey) return;
+    const desiredUrl = playableUrl(segment);
+    if (!segment || !desiredUrl) return;
+    if (
+      video?.dataset.assetKey === segment.assetKey &&
+      video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+      (isPlaying || video.dataset.sourceUrl === desiredUrl)
+    ) {
+      return;
+    }
     void showSegmentAt(segment, segment.trimStart, false).catch((error) => {
       setCacheStatus(
         error instanceof Error ? error.message : "Could not prepare this clip."
       );
     });
-  }, [playableUrl, playbackSegment, segments, showSegmentAt, visibleVideo]);
+  }, [
+    isPlaying,
+    playableUrl,
+    playbackSegment,
+    segments,
+    showSegmentAt,
+    visibleVideo,
+  ]);
 
   // Prime the standby slot through the first painted frame, not just metadata.
   useEffect(() => {
@@ -1575,6 +1788,27 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
     draftEndFrame >= draftStartFrame
       ? draftEndFrame - draftStartFrame + 1
       : 0;
+  const activeLocalMediaReady = Boolean(
+    activeSegment && localMediaUrls[activeSegment.assetKey]
+  );
+  const activeMediaCacheError = activeSegment
+    ? mediaCacheErrors[activeSegment.assetKey]
+    : undefined;
+  const cachePercent = activeLocalMediaReady
+    ? 100
+    : cacheProgress.totalBytes > 0
+    ? Math.min(
+        99,
+        Math.round(
+          (cacheProgress.loadedBytes / cacheProgress.totalBytes) * 100
+        )
+      )
+    : cacheProgress.total > 0
+    ? Math.min(
+        99,
+        Math.round((cacheProgress.ready / cacheProgress.total) * 100)
+      )
+    : 0;
 
   if (projectState === "planning") {
     return (
@@ -2207,6 +2441,51 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
           opacity: 0;
           visibility: visible;
           pointer-events: none;
+        }
+        .media-preparation-overlay {
+          position: absolute;
+          inset: 0;
+          z-index: 5;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          padding: 24px;
+          text-align: center;
+          background:
+            radial-gradient(circle at 50% 42%, rgba(49, 58, 91, 0.34), transparent 55%),
+            #09090b;
+          color: #fff;
+        }
+        .media-preparation-overlay strong {
+          font-size: 13px;
+        }
+        .media-preparation-overlay span {
+          color: #a1a1aa;
+          font-size: 10px;
+          line-height: 1.45;
+        }
+        .media-preparation-spinner {
+          width: 28px;
+          height: 28px;
+          border: 3px solid rgba(255, 255, 255, 0.14);
+          border-top-color: #fff;
+          border-radius: 50%;
+          animation: spin 0.8s linear infinite;
+        }
+        .media-preparation-track {
+          width: min(180px, 82%);
+          height: 5px;
+          overflow: hidden;
+          border-radius: 99px;
+          background: rgba(255, 255, 255, 0.12);
+        }
+        .media-preparation-fill {
+          height: 100%;
+          border-radius: inherit;
+          background: #fff;
+          transition: width 0.16s linear;
         }
         .player-controls {
           display: flex;
@@ -2864,6 +3143,14 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
             localMediaFilesRef.current.clear();
             processingUrlsRef.current.clear();
             setLocalMediaUrls({});
+            setMediaCacheErrors({});
+            setCacheProgress({
+              ready: 0,
+              total: segments.length,
+              loadedBytes: 0,
+              totalBytes: 0,
+              failed: 0,
+            });
             setThumbnails({});
             setCacheStatus("Local cache cleared. Clips will be prepared again.");
             setCacheEpoch((value) => value + 1);
@@ -3116,6 +3403,33 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
               crossOrigin="anonymous"
               aria-hidden="true"
             />
+            {activeSegment && !activeLocalMediaReady ? (
+              <div className="media-preparation-overlay" role="status">
+                {activeMediaCacheError ? (
+                  <>
+                    <strong>Preview media is not available</strong>
+                    <span>{activeMediaCacheError}</span>
+                  </>
+                ) : (
+                  <>
+                    <div className="media-preparation-spinner" />
+                    <strong>
+                      Preparing clip {activeSegment.clip.clip_number} locally
+                    </strong>
+                    <div className="media-preparation-track">
+                      <div
+                        className="media-preparation-fill"
+                        style={{ width: `${cachePercent}%` }}
+                      />
+                    </div>
+                    <span>
+                      {cachePercent}% · {cacheProgress.ready}/
+                      {cacheProgress.total || segments.length} clips cached
+                    </span>
+                  </>
+                )}
+              </div>
+            ) : null}
           </div>
 
           <div className="player-controls">
