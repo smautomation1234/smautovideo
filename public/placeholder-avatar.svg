@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 214" role="img" aria-labelledby="title">
+  <title id="title">Video frame placeholder</title>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#202027"/>
+      <stop offset="1" stop-color="#111116"/>
+    </linearGradient>
+  </defs>
+  <rect width="120" height="214" fill="url(#background)"/>
+  <circle cx="60" cy="82" r="24" fill="#3f3f49"/>
+  <path d="M22 173c3-35 18-53 38-53s35 18 38 53" fill="#3f3f49"/>
+  <path d="M46 81h28M60 67v28" stroke="#71717f" stroke-width="4" stroke-linecap="round"/>
+</svg>
