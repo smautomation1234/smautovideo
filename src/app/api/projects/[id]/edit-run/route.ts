@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireUser, unauthenticatedResponse } from "@/lib/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { buildEditVideoPrompt } from "@/features/video-import/edit-prompt";
 
 const segmentSchema = z.object({
   chunk_number: z.number().int().positive(),
@@ -14,23 +15,6 @@ const segmentSchema = z.object({
 const bodySchema = z.object({
   segments: z.array(segmentSchema).min(1).max(100),
 });
-
-function buildEditPrompt(
-  aspectRatio: string,
-  resolution: string,
-  clipNumber: number,
-  totalClips: number,
-  durationSeconds: number
-): string {
-  return `this is a short part of my video that i recorded so keep my character consistent and do not change voice and anything at all , do not change video pacing , keep it same as of mine
-also keep the lip sync as it is no matter what , i want you to keep the video exactly how mine started and exactly how mine ended same pacing , same timing , i want only edited version of my video 
-
-This is segment ${clipNumber} of ${totalClips}. Preserve continuity with the surrounding segments. Do not add a call to action or an artificial ending.
-
-TECHNICAL OUTPUT LOCK: exactly ${durationSeconds} seconds, ${aspectRatio}, ${resolution}.
-
-you have to edit the video as it is from start to end by using paper effect editing , use motion graphics , animations , color coding , and create a video for instagram in full viral format`;
-}
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
@@ -71,13 +55,13 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
         ? `[Edit mode] Segment ${segment.chunk_number} — original audio preserved`
         : `[Raw tail] ${segment.duration_seconds.toFixed(1)}s appended without editing`,
       prompt: segment.omni_duration > 0
-        ? buildEditPrompt(
-            project.aspect_ratio,
-            project.resolution || "720p",
-            segment.chunk_number,
+        ? buildEditVideoPrompt({
+            aspectRatio: project.aspect_ratio,
+            resolution: project.resolution || "720p",
+            clipNumber: segment.chunk_number,
             totalClips,
-            segment.omni_duration
-          )
+            durationSeconds: segment.omni_duration,
+          })
         : "Raw footage — no Omni processing needed",
     }));
     const { data: result, error } = await db.rpc("configure_edit_project", {

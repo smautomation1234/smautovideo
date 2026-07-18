@@ -84,7 +84,7 @@ async function submitOmniJob(db: DB, job: GenerationJob) {
       .eq("id", take.id);
     await event(db, job.id, "info", `[Edit Mode] Submitting Clip ${clip.clip_number}, Take ${take.take_number} with source video.`, { duration: clip.duration_seconds, aspect_ratio: project.aspect_ratio, resolution: project.resolution, edit_mode: true });
 
-    requestBody = omniEditRequest(project, clip.prompt, videoBytes.toString("base64"));
+    requestBody = omniEditRequest(clip.prompt, videoBytes.toString("base64"));
   } else {
     const startedAt = job.started_at || new Date().toISOString();
     await updateJob(db, job.id, {
@@ -270,8 +270,7 @@ function omniRequest(project: Project, prompt: string, mime: string, data: strin
   };
 }
 
-function omniEditRequest(project: Project, prompt: string, videoData: string) {
-  const locked = `${prompt}\n\nTECHNICAL OUTPUT LOCK: exactly ${project.aspect_ratio}, ${project.resolution}, no alternate aspect ratio. Preserve original synchronized spoken audio exactly.`;
+function omniEditRequest(prompt: string, videoData: string) {
   return {
     background: true,
     store: true,
@@ -279,7 +278,7 @@ function omniEditRequest(project: Project, prompt: string, videoData: string) {
     input: [
       {
         type: "text",
-        text: locked
+        text: prompt
       },
       {
         type: "video",
