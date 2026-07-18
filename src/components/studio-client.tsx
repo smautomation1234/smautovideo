@@ -976,15 +976,25 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
 
   // Filmstrip thumbnails use Mediabunny's optimized monotonically-sorted decoder.
   const processingUrlsRef = useRef<Set<string>>(new Set());
+  const thumbnailAttemptsRef = useRef<Map<string, number>>(new Map());
+  const [thumbnailRetryEpoch, setThumbnailRetryEpoch] = useState(0);
+  const [thumbnailErrors, setThumbnailErrors] = useState<
+    Record<string, string>
+  >({});
 
   useEffect(() => {
     let cancelled = false;
+    const retryTimers = new Set<number>();
     const generateThumbnails = async () => {
       for (const seg of segments) {
         if (cancelled) return;
         const key = seg.assetKey;
         const file = localMediaFilesRef.current.get(key);
-        if (!file || thumbnails[key] || processingUrlsRef.current.has(key)) {
+        const existingFrames = thumbnails[key];
+        const hasRealFrames = existingFrames?.some(
+          (frame) => frame !== "/placeholder-avatar.svg"
+        );
+        if (!file || hasRealFrames || processingUrlsRef.current.has(key)) {
           continue;
         }
         processingUrlsRef.current.add(key);
@@ -993,61 +1003,120 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
           { length: Math.max(1, Math.ceil(duration)) },
           (_, index) => Math.min(duration - 1 / timelineFps, index)
         );
-        const frames: string[] = [];
-        const input = new Input({
-          source: new BlobSource(file),
-          formats: ALL_FORMATS,
-        });
         try {
-          const track = await input.getPrimaryVideoTrack();
-          if (!track || !(await track.canDecode())) {
-            throw new Error("Video track cannot be decoded.");
-          }
-          const sink = new CanvasSink(track, {
-            width: 120,
-            height: data.project.aspect_ratio === "9:16" ? 214 : 68,
-            fit: "cover",
-            poolSize: 1,
-          });
-          for await (const result of sink.canvasesAtTimestamps(timestamps)) {
-            if (cancelled) return;
-            if (!result) {
-              frames.push("/placeholder-avatar.svg");
-              continue;
-            }
-            if (result.canvas instanceof HTMLCanvasElement) {
-              frames.push(result.canvas.toDataURL("image/jpeg", 0.62));
-            } else {
-              const blob = await result.canvas.convertToBlob({
-                type: "image/jpeg",
-                quality: 0.62,
+          const width = 120;
+          const height = data.project.aspect_ratio === "9:16" ? 214 : 68;
+          let frames: string[];
+          try {
+            const input = new Input({
+              source: new BlobSource(file),
+              formats: ALL_FORMATS,
+            });
+            try {
+              const track = await input.getPrimaryVideoTrack();
+              if (!track || !(await track.canDecode())) {
+                throw new Error(
+                  "WebCodecs cannot decode this track in the current browser."
+                );
+              }
+              const sink = new CanvasSink(track, {
+                width,
+                height,
+                fit: "cover",
+                poolSize: 1,
               });
-              const thumbnailUrl = URL.createObjectURL(blob);
-              thumbnailObjectUrlsRef.current.add(thumbnailUrl);
-              frames.push(thumbnailUrl);
+              const decodedFrames: string[] = [];
+              for await (const result of sink.canvasesAtTimestamps(timestamps)) {
+                if (cancelled) return;
+                if (!result) {
+                  throw new Error(
+                    "WebCodecs returned no frame for a requested timestamp."
+                  );
+                }
+                if (result.canvas instanceof HTMLCanvasElement) {
+                  decodedFrames.push(
+                    result.canvas.toDataURL("image/jpeg", 0.68)
+                  );
+                } else {
+                  const blob = await result.canvas.convertToBlob({
+                    type: "image/jpeg",
+                    quality: 0.68,
+                  });
+                  const thumbnailUrl = URL.createObjectURL(blob);
+                  thumbnailObjectUrlsRef.current.add(thumbnailUrl);
+                  decodedFrames.push(thumbnailUrl);
+                }
+              }
+              if (decodedFrames.length !== timestamps.length) {
+                throw new Error(
+                  `WebCodecs decoded ${decodedFrames.length} of ${timestamps.length} thumbnails.`
+                );
+              }
+              frames = decodedFrames;
+            } finally {
+              input.dispose();
             }
+          } catch (webCodecsError) {
+            console.info(
+              "WebCodecs thumbnail extraction unavailable; using native video fallback.",
+              key,
+              webCodecsError
+            );
+            frames = await generateNativeVideoThumbnails(
+              file,
+              timestamps,
+              width,
+              height,
+              () => cancelled
+            );
           }
           if (!cancelled) {
             setThumbnails((current) => ({ ...current, [key]: frames }));
+            thumbnailAttemptsRef.current.delete(key);
+            setThumbnailErrors((current) => {
+              if (!current[key]) return current;
+              const next = { ...current };
+              delete next[key];
+              return next;
+            });
           }
         } catch (error) {
           console.warn("Could not generate timeline thumbnails:", key, error);
-          if (!cancelled) {
-            setThumbnails((current) => ({
+          const attempts = (thumbnailAttemptsRef.current.get(key) || 0) + 1;
+          thumbnailAttemptsRef.current.set(key, attempts);
+          if (!cancelled && attempts < 3) {
+            const timer = window.setTimeout(
+              () => setThumbnailRetryEpoch((value) => value + 1),
+              attempts * 750
+            );
+            retryTimers.add(timer);
+          } else if (!cancelled) {
+            setThumbnailErrors((current) => ({
               ...current,
-              [key]: Array(timestamps.length).fill("/placeholder-avatar.svg"),
+              [key]:
+                error instanceof Error
+                  ? error.message
+                  : "Thumbnail extraction failed.",
             }));
           }
         } finally {
-          input.dispose();
+          processingUrlsRef.current.delete(key);
         }
       }
     };
     void generateThumbnails();
     return () => {
       cancelled = true;
+      for (const timer of retryTimers) window.clearTimeout(timer);
     };
-  }, [segments, localMediaUrls, thumbnails, timelineFps, data.project.aspect_ratio]);
+  }, [
+    data.project.aspect_ratio,
+    localMediaUrls,
+    segments,
+    thumbnailRetryEpoch,
+    thumbnails,
+    timelineFps,
+  ]);
 
   // Synchronize Volumes & Playback state in real-time
   useEffect(() => {
@@ -2717,6 +2786,36 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
           height: 100%;
           object-fit: cover;
         }
+        .clip-thumbnail-loading,
+        .clip-thumbnail-error {
+          width: 100%;
+          height: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: #d4d4d8;
+          font-size: 10px;
+          font-weight: 700;
+          letter-spacing: 0.02em;
+          background:
+            linear-gradient(
+              110deg,
+              rgba(255,255,255,.025) 25%,
+              rgba(255,255,255,.1) 42%,
+              rgba(255,255,255,.025) 58%
+            ),
+            #1b1b21;
+          background-size: 220% 100%;
+          animation: thumbnail-shimmer 1.2s linear infinite;
+        }
+        .clip-thumbnail-error {
+          color: #fca5a5;
+          background: #211719;
+          animation: none;
+        }
+        @keyframes thumbnail-shimmer {
+          to { background-position: -220% 0; }
+        }
         .clip-label-overlay {
           position: absolute;
           left: 8px;
@@ -3142,8 +3241,10 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
             thumbnailObjectUrlsRef.current.clear();
             localMediaFilesRef.current.clear();
             processingUrlsRef.current.clear();
+            thumbnailAttemptsRef.current.clear();
             setLocalMediaUrls({});
             setMediaCacheErrors({});
+            setThumbnailErrors({});
             setCacheProgress({
               ready: 0,
               total: segments.length,
@@ -3710,7 +3811,7 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
                   >
                     {/* Repeated Filmstrip Thumbnails */}
                     <div className="clip-thumbnails">
-                      {thumbnails[seg.assetKey] ? (
+                      {thumbnails[seg.assetKey]?.length ? (
                         thumbnails[seg.assetKey].slice(
                           Math.floor(seg.trimStart),
                           Math.max(Math.floor(seg.trimStart) + 1, Math.ceil(seg.trimEnd))
@@ -3726,24 +3827,14 @@ export function StudioClient({ initial }: { initial: StudioPayload }) {
                             }}
                           />
                         ))
+                      ) : thumbnailErrors[seg.assetKey] ? (
+                        <div className="clip-thumbnail-error">
+                          Preview unavailable
+                        </div>
                       ) : (
-                        Array.from({
-                          length: Math.max(1, Math.ceil(width / 50)),
-                        }).map((_, idx) => (
-                          <img
-                            key={idx}
-                            src={
-                              data.presenter?.signed_url ||
-                              "/placeholder-avatar.svg"
-                            }
-                            alt="Thumbnail"
-                            style={{
-                              width: "50px",
-                              height: "100%",
-                              objectFit: "cover",
-                            }}
-                          />
-                        ))
+                        <div className="clip-thumbnail-loading">
+                          Extracting video frames…
+                        </div>
                       )}
                     </div>
 
@@ -4094,6 +4185,116 @@ function waitForPresentedFrame(video: HTMLVideoElement) {
     };
     const timeout = window.setTimeout(finish, 300);
     video.requestVideoFrameCallback(() => finish());
+  });
+}
+
+async function generateNativeVideoThumbnails(
+  file: File | Blob,
+  timestamps: number[],
+  width: number,
+  height: number,
+  isCancelled: () => boolean
+) {
+  const sourceUrl = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.preload = "auto";
+  video.playsInline = true;
+  video.muted = true;
+  video.style.position = "fixed";
+  video.style.width = "1px";
+  video.style.height = "1px";
+  video.style.opacity = "0";
+  video.style.pointerEvents = "none";
+  video.style.left = "-10000px";
+  document.body.appendChild(video);
+
+  try {
+    video.src = sourceUrl;
+    video.load();
+    await waitForMediaEvent(video, "loadedmetadata");
+    await waitForMediaEvent(video, "loadeddata");
+    if (!video.videoWidth || !video.videoHeight) {
+      throw new Error("The native video decoder returned no display size.");
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("Could not create the thumbnail canvas.");
+
+    const targetRatio = width / height;
+    const sourceRatio = video.videoWidth / video.videoHeight;
+    let sourceX = 0;
+    let sourceY = 0;
+    let sourceWidth = video.videoWidth;
+    let sourceHeight = video.videoHeight;
+    if (sourceRatio > targetRatio) {
+      sourceWidth = sourceHeight * targetRatio;
+      sourceX = (video.videoWidth - sourceWidth) / 2;
+    } else if (sourceRatio < targetRatio) {
+      sourceHeight = sourceWidth / targetRatio;
+      sourceY = (video.videoHeight - sourceHeight) / 2;
+    }
+
+    const frames: string[] = [];
+    const lastDrawableTime = Number.isFinite(video.duration)
+      ? Math.max(0, video.duration - 1 / TIMELINE_FPS)
+      : Number.POSITIVE_INFINITY;
+    for (const timestamp of timestamps) {
+      if (isCancelled()) throw new Error("Thumbnail extraction was cancelled.");
+      const safeTime = Math.max(0, Math.min(lastDrawableTime, timestamp));
+      if (Math.abs(video.currentTime - safeTime) > 0.0005) {
+        await seekVideoForThumbnail(video, safeTime);
+      }
+      await waitForPresentedFrame(video);
+      context.fillStyle = "#000";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(
+        video,
+        sourceX,
+        sourceY,
+        sourceWidth,
+        sourceHeight,
+        0,
+        0,
+        width,
+        height
+      );
+      frames.push(canvas.toDataURL("image/jpeg", 0.68));
+    }
+    return frames;
+  } finally {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    video.remove();
+    URL.revokeObjectURL(sourceUrl);
+  }
+}
+
+function seekVideoForThumbnail(video: HTMLVideoElement, time: number) {
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      video.removeEventListener("seeked", onSeeked);
+      video.removeEventListener("error", onError);
+    };
+    const onSeeked = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = () => {
+      cleanup();
+      reject(new Error("The native video decoder failed while seeking."));
+    };
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out while seeking a timeline thumbnail."));
+    }, 8000);
+    video.addEventListener("seeked", onSeeked, { once: true });
+    video.addEventListener("error", onError, { once: true });
+    video.currentTime = time;
   });
 }
 

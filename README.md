@@ -77,6 +77,7 @@ For a new Supabase project, run every SQL file below in filename order:
 4. `supabase/migrations/202607180004_production_hardening.sql`
 5. `supabase/migrations/202607180005_editor_reliability.sql`
 6. `supabase/migrations/202607180006_native_24_fps.sql`
+7. `supabase/migrations/202607180007_timeline_save_ambiguity.sql`
 
 For a database that already had the old schema and both old migration files,
 run:
@@ -85,6 +86,7 @@ run:
 supabase/migrations/202607180004_production_hardening.sql
 supabase/migrations/202607180005_editor_reliability.sql
 supabase/migrations/202607180006_native_24_fps.sql
+supabase/migrations/202607180007_timeline_save_ambiguity.sql
 ```
 
 The fourth migration enables `pg_cron`, `pg_net`, and Vault; hardens privileged
@@ -97,6 +99,9 @@ errors used by the live Table View progress and prompt-level error messages.
 The sixth migration converts saved timeline frame boundaries from their old
 rate to 24 FPS while preserving playback times, updates new timeline defaults,
 and enforces the canonical native rate.
+
+The seventh migration qualifies timeline save queries to prevent PostgreSQL
+from confusing the function's `timeline_id` output with the table column.
 
 ## Production deployment
 
